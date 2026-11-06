@@ -151,6 +151,12 @@ pub(crate) fn package_mutated_arg(pkg: &str, method: &str) -> Option<usize> {
             "read_full" | "read_at_least" | "ReadFull" | "ReadAtLeast",
         ) => Some(1),
         ("io", "copy_buffer" | "CopyBuffer") => Some(2),
+        ("hex", "encode" | "decode" | "Encode" | "Decode") => Some(0),
+        (
+            "json",
+            "compact" | "indent" | "html_escape" | "Compact" | "Indent" | "HTMLEscape",
+        ) => Some(0),
+        ("json", "unmarshal" | "Unmarshal") => Some(1),
         _ => None,
     }
 }
@@ -212,10 +218,16 @@ pub(crate) fn package_result_count(pkg: &str, method: &str) -> Option<usize> {
         (
             "os",
             "open"
+                | "open_file"
                 | "create"
                 | "read_file"
                 | "read_dir"
                 | "getwd"
+                | "hostname"
+                | "readlink"
+                | "find_process"
+                | "start_process"
+                | "getgroups"
                 | "user_home_dir"
                 | "user_cache_dir"
                 | "user_config_dir"
@@ -226,10 +238,16 @@ pub(crate) fn package_result_count(pkg: &str, method: &str) -> Option<usize> {
                 | "create_temp"
                 | "mkdir_temp"
                 | "Open"
+                | "OpenFile"
                 | "Create"
                 | "ReadFile"
                 | "ReadDir"
                 | "Getwd"
+                | "Hostname"
+                | "Readlink"
+                | "FindProcess"
+                | "StartProcess"
+                | "Getgroups"
                 | "UserHomeDir"
                 | "UserCacheDir"
                 | "UserConfigDir"
@@ -240,6 +258,7 @@ pub(crate) fn package_result_count(pkg: &str, method: &str) -> Option<usize> {
                 | "CreateTemp"
                 | "MkdirTemp",
         ) => Some(2),
+        ("os", "pipe" | "Pipe") => Some(3),
         (
             "io",
             "read_all"
@@ -299,7 +318,29 @@ pub(crate) fn package_result_count(pkg: &str, method: &str) -> Option<usize> {
                 | "LookupHost",
         ) => Some(2),
         ("net", "split_host_port" | "SplitHostPort") => Some(3),
-        ("hex", "decode_string" | "DecodeString") => Some(2),
+        (
+            "url",
+            "parse"
+                | "parse_request_uri"
+                | "parse_query"
+                | "query_unescape"
+                | "path_unescape"
+                | "join_path"
+                | "Parse"
+                | "ParseRequestURI"
+                | "ParseQuery"
+                | "QueryUnescape"
+                | "PathUnescape"
+                | "JoinPath",
+        ) => Some(2),
+        (
+            "json",
+            "marshal" | "marshal_indent" | "Marshal" | "MarshalIndent",
+        ) => Some(2),
+        (
+            "hex",
+            "decode_string" | "decode" | "DecodeString" | "Decode",
+        ) => Some(2),
         ("regex", "compile" | "match_string" | "Compile" | "MatchString") => Some(2),
         _ => None,
     }
