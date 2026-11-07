@@ -871,6 +871,25 @@ impl<'a> Checker<'a> {
                     _ => None,
                 }
             }
+            Expr::Slice { base, span, .. } => {
+                let base_ty = self.ty_of_expr(st, base)?;
+                match self.peel_pointer_and_alias(&base_ty) {
+                    TypeExpr::Slice { elem, .. } | TypeExpr::Array { elem, .. } => {
+                        Some(TypeExpr::Slice {
+                            elem,
+                            span: *span,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Receive { chan, .. } => {
+                let chan_ty = self.ty_of_expr(st, chan)?;
+                match self.peel_pointer_and_alias(&chan_ty) {
+                    TypeExpr::Chan { elem, .. } => Some(*elem),
+                    _ => None,
+                }
+            }
             Expr::StructLit { ty, .. } => ty.clone(),
             Expr::MapLit {
                 key, value, span, ..
@@ -962,6 +981,18 @@ impl<'a> Checker<'a> {
                             });
                         }
                     }
+                    if !self.fns.contains_key(name.as_str()) {
+                        if let Some((ename, _)) = self
+                            .enums
+                            .iter()
+                            .find(|(_, vs)| vs.iter().any(|v| v == name))
+                        {
+                            return Some(TypeExpr::Named {
+                                name: ename.clone(),
+                                span: *span,
+                            });
+                        }
+                    }
                     let head = Self::base_named_type_str(name);
                     self.fns
                         .get(name.as_str())
@@ -973,6 +1004,14 @@ impl<'a> Checker<'a> {
                     let head = Self::base_named_type_str(name);
                     if let Expr::Ident { name: root, .. } = crate::model::unwrap_parens(base) {
                         if self.lookup_binding(st, root).is_none() {
+                            if let Some(vs) = self.enums.get(root.as_str()) {
+                                if vs.iter().any(|v| v == name) {
+                                    return Some(TypeExpr::Named {
+                                        name: root.clone(),
+                                        span: *span,
+                                    });
+                                }
+                            }
                             let full = format!("{}.{}", root, head);
                             if let Some(f) = self.fns.get(full.as_str()) {
                                 return f.results.first().map(|r| r.ty.clone());
@@ -1276,10 +1315,14 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        let is_option_some =
+            |segments: &[String]| segments == ["some"] || segments == ["option", "some"];
+        let is_option_none =
+            |segments: &[String]| segments == ["none"] || segments == ["option", "none"];
         if matches!(target, MatchTarget::Unknown) {
             for arm in arms {
                 if let MatchPattern::Path { segments, .. } = &arm.pattern {
-                    if segments.as_slice() == ["some"] || segments.as_slice() == ["none"] {
+                    if is_option_some(segments) || is_option_none(segments) {
                         target = MatchTarget::Option;
                         break;
                     } else if segments.len() == 2 {
@@ -1310,10 +1353,10 @@ impl<'a> Checker<'a> {
                         continue;
                     }
                     match &arm.pattern {
-                        MatchPattern::Path { segments, .. } if segments.as_slice() == ["some"] => {
+                        MatchPattern::Path { segments, .. } if is_option_some(segments) => {
                             has_some = true;
                         }
-                        MatchPattern::Path { segments, .. } if segments.as_slice() == ["none"] => {
+                        MatchPattern::Path { segments, .. } if is_option_none(segments) => {
                             has_none = true;
                         }
                         MatchPattern::Wildcard if has_some => {
@@ -1351,6 +1394,32 @@ impl<'a> Checker<'a> {
                 }
             }
             MatchTarget::Enum(enum_name, variants) => {
+                for arm in arms {
+                    if let MatchPattern::Path { segments, .. } = &arm.pattern {
+                        let is_opt_pat = (is_option_some(segments) || is_option_none(segments))
+                            && enum_name != "option"
+                            && !(segments.len() == 1 && variants.iter().any(|v| v == &segments[0]));
+                        if is_opt_pat {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    "HYB-E5001",
+                                    self.path.clone(),
+                                    span,
+                                    format!(
+                                        "`some`/`none` option patterns are not allowed on non-`option` match subject of type `{enum_name}` (HYB-E5001)"
+                                    ),
+                                )
+                                .with_notes(vec![
+                                    format!(
+                                        "why: the `match` subject has static enum type `{enum_name}`, so `some`/`none` constructor patterns are unsound (T13/T20)",
+                                    ),
+                                    "fix: match on the enum's own variants, or unwrap the `option[T]` value first before matching it.".to_string(),
+                                ]),
+                            );
+                            return;
+                        }
+                    }
+                }
                 let has_trailing_wildcard = arms.last().is_some_and(|a| {
                     matches!(a.pattern, MatchPattern::Wildcard) && a.guard.is_none()
                 });
@@ -1403,7 +1472,7 @@ impl<'a> Checker<'a> {
                 // so accepting them is unsound — reject fail-closed.
                 for arm in arms {
                     if let MatchPattern::Path { segments, .. } = &arm.pattern {
-                        if segments.as_slice() == ["some"] || segments.as_slice() == ["none"] {
+                        if is_option_some(segments) || is_option_none(segments) {
                             self.diags.push(
                                 Diagnostic::error(
                                     "HYB-E5001",
