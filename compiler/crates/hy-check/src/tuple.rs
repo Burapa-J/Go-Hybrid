@@ -159,15 +159,8 @@ impl<'a> Checker<'a> {
                     if let Some(g) = &arm.guard {
                         let mut arm_st = st.clone();
                         if let hy_syntax::MatchPattern::Path { segments, binding: Some(b) } = &arm.pattern {
-                            if segments == &["some"] {
-                                arm_st.scope_push();
-                                self.bind_match_arm(&mut arm_st, b, subject, false);
-                                if let Some(TypeExpr::Option { elem, .. }) = self.ty_of_expr(st, subject).map(|t| self.resolve_type_alias(&t)) {
-                                    if let Some(bind) = arm_st.env_lookup_mut(b) {
-                                        bind.ty = Some(*elem);
-                                    }
-                                }
-                            }
+                            arm_st.scope_push();
+                            self.bind_match_arm_for_tuple(&mut arm_st, b, subject, segments);
                         }
                         self.check_expr_single_value(&arm_st, g, g.span());
                     }
@@ -221,32 +214,44 @@ impl<'a> Checker<'a> {
     }
 
     fn check_type_expr_single_value(&mut self, st: &FnState, ty: &TypeExpr) {
+        self.check_type_expr_single_value_at(st, ty, None);
+    }
+
+    fn check_type_expr_single_value_at(&mut self, st: &FnState, ty: &TypeExpr, span_override: Option<Span>) {
         match ty {
-            TypeExpr::Named { .. } => {}
+            TypeExpr::Named { name, span } => {
+                let sanitized = name.replace("(...)", "()");
+                if let Some((_, args)) = Self::parse_generic_type_args(&sanitized) {
+                    let s = span_override.unwrap_or(*span);
+                    for arg in &args {
+                        self.check_type_expr_single_value_at(st, arg, Some(s));
+                    }
+                }
+            }
             TypeExpr::Array { len, elem, .. } => {
                 if let Some(len_expr) = len {
-                    self.check_expr_single_value(st, len_expr, len_expr.span());
+                    self.check_expr_single_value(st, len_expr, span_override.unwrap_or_else(|| len_expr.span()));
                 }
-                self.check_type_expr_single_value(st, elem);
+                self.check_type_expr_single_value_at(st, elem, span_override);
             }
             TypeExpr::Slice { elem, .. }
             | TypeExpr::Pointer { to: elem, .. }
             | TypeExpr::Option { elem, .. }
             | TypeExpr::Chan { elem, .. } => {
-                self.check_type_expr_single_value(st, elem);
+                self.check_type_expr_single_value_at(st, elem, span_override);
             }
             TypeExpr::Map { key, value, .. } => {
-                self.check_type_expr_single_value(st, key);
-                self.check_type_expr_single_value(st, value);
+                self.check_type_expr_single_value_at(st, key, span_override);
+                self.check_type_expr_single_value_at(st, value, span_override);
             }
             TypeExpr::Fn {
                 params, results, ..
             } => {
                 for p in params {
-                    self.check_type_expr_single_value(st, &p.ty);
+                    self.check_type_expr_single_value_at(st, &p.ty, span_override);
                 }
                 for r in results {
-                    self.check_type_expr_single_value(st, r);
+                    self.check_type_expr_single_value_at(st, r, span_override);
                 }
             }
         }
@@ -323,7 +328,10 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Expr::StructLit { fields, .. } => {
+            Expr::StructLit { ty, fields, .. } => {
+                if let Some(t) = ty {
+                    self.check_type_expr_single_value(st, t);
+                }
                 for f in fields {
                     self.check_expr_single_value(st, &f.value, f.span);
                 }
@@ -930,6 +938,15 @@ impl<'a> Checker<'a> {
                             is_let,
                         );
                     }
+                } else if l.values.len() == 1 && l.names.len() > 1 {
+                    let pre_st = st.clone();
+                    let tys = self.multi_value_tys(&pre_st, &l.values[0], l.names.len());
+                    for (i, name) in l.names.iter().enumerate() {
+                        let ty = l.ty.clone().or_else(|| tys.get(i).cloned().flatten());
+                        let shape = ty.as_ref().map(|t| self.shape_of_type(t)).unwrap_or(TypeShape::Unknown);
+                        self.define_binding(st, name, shape, ty, immutable, false, is_let);
+                        st.closure_defs.remove(name);
+                    }
                 } else if l.names.len() == l.values.len() {
                     let pre_st = st.clone();
                     for (name, val) in l.names.iter().zip(l.values.iter()) {
@@ -1009,14 +1026,39 @@ impl<'a> Checker<'a> {
                 }
                 st.scope_pop();
             }
-            Stmt::For { body, .. } | Stmt::Managed { body, .. } | Stmt::Block { block: body, .. } => {
+            Stmt::For { kind, body, .. } => {
+                st.scope_push();
+                match kind {
+                    ForKind::Range { var, .. } => {
+                        self.define_binding(st, var, TypeShape::Primitive, None, false, false, false);
+                        st.closure_defs.remove(var);
+                    }
+                    ForKind::Iterate { vars, expr } => {
+                        let shapes = self.iterate_var_shapes(st, expr, vars.len());
+                        let tys = self.iterate_var_tys(st, expr, vars.len());
+                        for (i, v) in vars.iter().enumerate() {
+                            let shape = shapes.get(i).cloned().unwrap_or(TypeShape::Unknown);
+                            let ty = tys.get(i).cloned().flatten();
+                            self.define_binding(st, v, shape, ty, false, false, false);
+                            st.closure_defs.remove(v);
+                        }
+                    }
+                    _ => {}
+                }
+                self.check_const_closure_block(st, body);
+                st.scope_pop();
+            }
+            Stmt::Managed { body, .. } | Stmt::Block { block: body, .. } => {
                 st.scope_push();
                 self.check_const_closure_block(st, body);
                 st.scope_pop();
             }
-            Stmt::Match { arms, .. } => {
+            Stmt::Match { subject, arms, .. } => {
                 for arm in arms {
                     st.scope_push();
+                    if let hy_syntax::MatchPattern::Path { segments, binding: Some(b) } = &arm.pattern {
+                        self.bind_match_arm_for_tuple(st, b, subject, segments);
+                    }
                     self.check_const_closure_block(st, &arm.body);
                     st.scope_pop();
                 }
@@ -1024,11 +1066,74 @@ impl<'a> Checker<'a> {
             Stmt::Select { arms, .. } => {
                 for arm in arms {
                     st.scope_push();
+                    if let SelectArmKind::Recv { names, chan } = &arm.kind {
+                        let elem_ty = self
+                            .ty_of_expr(st, chan)
+                            .or_else(|| self.composite_type_expr(st, chan))
+                            .map(|t| self.peel_pointer_and_alias(&t))
+                            .and_then(|t| match t {
+                                TypeExpr::Chan { elem, .. } => Some(*elem),
+                                _ => None,
+                            });
+                        for (i, n) in names.iter().enumerate() {
+                            let ty = if i == 0 { elem_ty.clone() } else { None };
+                            let shape = ty.as_ref().map(|t| self.shape_of_type(t)).unwrap_or(TypeShape::Unknown);
+                            self.define_binding(st, n, shape, ty, false, false, false);
+                            st.closure_defs.remove(n);
+                        }
+                    }
                     self.check_const_closure_block(st, &arm.body);
                     st.scope_pop();
                 }
             }
             _ => {}
         }
+    }
+
+    fn bind_match_arm_for_tuple(&mut self, st: &mut FnState, b: &str, subject: &Expr, segments: &[String]) {
+        let payload_ty = self.match_arm_payload_ty(st, subject, segments);
+        self.bind_match_arm(st, b, subject, false);
+        st.closure_defs.remove(b);
+        if let Some(bind) = st.env_lookup_mut(b) {
+            if let Some(pty) = payload_ty {
+                bind.shape = self.shape_of_type(&pty);
+                bind.ty = Some(pty);
+            } else {
+                bind.ty = None;
+            }
+        }
+    }
+
+    fn match_arm_payload_ty(&self, st: &FnState, subject: &Expr, segments: &[String]) -> Option<TypeExpr> {
+        let is_opt_some = matches!(segments, [s] if s == "some")
+            || matches!(segments, [p, s] if p == "option" && s == "some");
+        let subj_ty = self
+            .ty_of_expr(st, subject)
+            .or_else(|| self.composite_type_expr(st, subject))
+            .map(|t| self.peel_pointer_and_alias(&t));
+        if is_opt_some {
+            return match subj_ty {
+                Some(TypeExpr::Option { elem, .. }) => Some(*elem),
+                _ => None,
+            };
+        }
+        let variant_name = segments.last()?.as_str();
+        let enum_hint = if segments.len() == 2 {
+            Some(segments[0].as_str())
+        } else if let Some(TypeExpr::Named { name, .. }) = &subj_ty {
+            Some(Self::base_named_type_str(name))
+        } else {
+            None
+        };
+        for d in &self.file.decls {
+            if let hy_syntax::Decl::Enum(e) = d {
+                if enum_hint.is_none_or(|h| e.name == h) {
+                    if let Some(v) = e.variants.iter().find(|v| v.name == variant_name) {
+                        return v.payload.clone();
+                    }
+                }
+            }
+        }
+        None
     }
 }
