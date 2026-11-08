@@ -1517,9 +1517,11 @@ impl<'a> Checker<'a> {
         managed: bool,
     ) {
         // A3 loan creation: `svc := &e.services[existing]` (including parallel defines)
+        for val in &l.values {
+            self.check_addr_of_const_loan(st, val);
+        }
         if l.names.len() == l.values.len() {
             for (name, val) in l.names.iter().zip(l.values.iter()) {
-                self.check_addr_of_const_loan(st, val);
                 if let Some(path) = walk::addr_of_index_base_path(val) {
                     let binding = name.clone();
                     let key = walk::addr_of_index_slot_key(val);
@@ -1547,6 +1549,33 @@ impl<'a> Checker<'a> {
                 } else {
                     self.extend_map_slot_loan_to_alias(st, name, val, idx);
                 }
+            }
+        } else if l.values.len() == 1 && l.names.len() == 2 {
+            let val = &l.values[0];
+            if let Some(path) = walk::addr_of_index_base_path(val) {
+                let binding = l.names[0].clone();
+                let key = walk::addr_of_index_slot_key(val);
+                self.emit_o8_alias_if_live(
+                    st,
+                    &path,
+                    key.as_deref(),
+                    Some(&binding),
+                    val.span(),
+                    idx,
+                    "a second slot loan",
+                );
+                let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
+                st.loans.push(Loan {
+                    target: LoanTarget::MapSlot {
+                        binding: binding.clone(),
+                        path,
+                        key,
+                    },
+                    created: idx,
+                    last,
+                    span: val.span(),
+                    desc: format!("`{} := {}`", l.names.join(", "), val.render()),
+                });
             }
         }
 
@@ -2346,7 +2375,7 @@ impl<'a> Checker<'a> {
     /// A projection of a call-produced value has independent storage only
     /// when the call returns a value copy or a proven fresh slice backing array.
     fn addr_operand_returns_fresh_copy(&self, st: &FnState, expr: &Expr) -> bool {
-        match unwrap_parens(expr) {
+        match crate::model::unwrap_parens_and_move(expr) {
             Expr::Index { base, .. } | Expr::Field { base, .. } | Expr::Slice { base, .. } => {
                 self.addr_operand_returns_fresh_copy(st, base)
             }
@@ -6549,9 +6578,11 @@ impl<'a> Checker<'a> {
         idx: usize,
     ) {
         // A3 loan creation on assignment: `x = &m[k]`
+        for v in values {
+            self.check_addr_of_const_loan(st, v);
+        }
         if op == AssignOp::Assign && targets.len() == values.len() {
             for (t, v) in targets.iter().zip(values.iter()) {
-                self.check_addr_of_const_loan(st, v);
                 if let PlaceKind::Ident(name) = &t.kind {
                     if let Some(path) = walk::addr_of_index_base_path(v) {
                         let binding = name.clone();
@@ -6583,6 +6614,35 @@ impl<'a> Checker<'a> {
                     if matches!(self.shape_of_expr(st, v), TypeShape::BorrowHandle(_)) {
                         self.extend_call_loans_to_view(st, v, name, idx);
                     }
+                }
+            }
+        } else if op == AssignOp::Assign && values.len() == 1 && targets.len() == 2 {
+            let v = &values[0];
+            if let PlaceKind::Ident(name) = &targets[0].kind {
+                if let Some(path) = walk::addr_of_index_base_path(v) {
+                    let binding = name.clone();
+                    let key = walk::addr_of_index_slot_key(v);
+                    self.emit_o8_alias_if_live(
+                        st,
+                        &path,
+                        key.as_deref(),
+                        Some(&binding),
+                        v.span(),
+                        idx,
+                        "a second slot loan",
+                    );
+                    let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
+                    st.loans.push(Loan {
+                        target: LoanTarget::MapSlot {
+                            binding: binding.clone(),
+                            path,
+                            key,
+                        },
+                        created: idx,
+                        last,
+                        span: v.span(),
+                        desc: format!("`{} = {}`", binding, v.render()),
+                    });
                 }
             }
         }
@@ -7218,10 +7278,10 @@ impl<'a> Checker<'a> {
     /// of the declaring block. Taking an index or field loan of a `const`
     /// therefore writes to the `const` at runtime (T22, HYB-E3006).
     pub(crate) fn check_addr_of_const_loan(&mut self, st: &FnState, val: &Expr) {
-        let Some(operand) = as_addr_of(val) else {
+        let Some(operand) = as_addr_of(crate::model::unwrap_parens_and_move(val)) else {
             return;
         };
-        let operand = unwrap_parens(operand);
+        let operand = crate::model::unwrap_parens_and_move(operand);
         if !matches!(operand, Expr::Index { .. } | Expr::Field { .. }) {
             return;
         }
@@ -7230,6 +7290,7 @@ impl<'a> Checker<'a> {
             roots.push(root.to_string());
         } else if !self.addr_operand_returns_fresh_copy(st, operand) {
             collect_ref_roots(operand, &mut roots);
+            collect_move_ident_sources(operand, &mut roots);
             self.collect_callee_const_return_roots(st, operand, &mut roots, 0);
         }
         for root in roots {
@@ -7904,13 +7965,15 @@ impl<'a> Checker<'a> {
         expr: &Expr,
         declared: &HashSet<String>,
     ) -> Option<String> {
-        let inner = crate::model::unwrap_parens(expr);
+        let inner = crate::model::unwrap_parens_and_move(expr);
         if let Some(addr_op) = as_addr_of(inner) {
+            let addr_op = crate::model::unwrap_parens_and_move(addr_op);
             let mut roots = Vec::new();
             if let Some(root) = addr_op.root_ident() {
                 roots.push(root.to_string());
             } else if !self.addr_operand_returns_fresh_copy(st, addr_op) {
                 collect_ref_roots(addr_op, &mut roots);
+                collect_move_ident_sources(addr_op, &mut roots);
                 self.collect_callee_const_return_roots(st, addr_op, &mut roots, 0);
             }
             for root in roots {
